@@ -1,0 +1,47 @@
+# FastAPI and web server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Pydantic for data validation
+pydantic
+pydantic-settings
+
+# Database drivers
+pymysql
+cryptography
+
+# Apache Spark with Iceberg support
+pyspark
+
+# AWS S3 support
+boto3
+botocore
+
+# Iceberg dependencies (install via spark-submit or add to SPARK_HOME)
+# These should be added to Spark's jars directory:
+# - iceberg-spark-runtime-3.5_2.12:1.4.3.jar
+# - aws-java-sdk-bundle-1.12.x.jar
+# - hadoop-aws-3.3.x.jar
+
+# Utilities
+python-dotenv
+python-jose[cryptography]
+requests
+
+# Logging and monitoring
+structlog
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+httpx
+# Code quality (optional - for development only, comment out if not needed)
+# black
+# flake8
+# isort
+# mypy
+
+# Development (optional)
+# pre-commit
