@@ -148,6 +148,11 @@ class SchemaMapper:
         if data_type == 'DECIMAL' or data_type == 'NUMERIC':
             precision = column_info.get('NUMERIC_PRECISION', 10)
             scale = column_info.get('NUMERIC_SCALE', 0)
+            # StarRocks DECIMAL max precision is 38
+            if precision > 38:
+                logger.warning(f"Column {column_info['COLUMN_NAME']}: DECIMAL({precision},{scale}) exceeds StarRocks limit, capping to DECIMAL(38,{min(scale, 38)})")
+                precision = 38
+                scale = min(scale, 38)
             return f"DECIMAL({precision},{scale})"
 
         # Handle VARCHAR/CHAR with length

@@ -13,6 +13,7 @@ cryptography
 
 # Apache Spark with Iceberg support
 pyspark
+findspark
 
 # AWS S3 support
 boto3

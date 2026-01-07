@@ -53,8 +53,8 @@ class SparkPipelineManager:
             # Get JAR files path
             jars_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "jars")
             jar_files = [
-                os.path.join(jars_dir, "iceberg-spark-runtime-3.5_2.12-1.4.3.jar"),
-                os.path.join(jars_dir, "iceberg-aws-bundle-1.4.3.jar"),
+                os.path.join(jars_dir, "iceberg-spark-runtime-3.5_2.12-1.7.1.jar"),
+                os.path.join(jars_dir, "iceberg-aws-bundle-1.7.1.jar"),
                 os.path.join(jars_dir, "aws-java-sdk-bundle-1.12.648.jar"),
                 os.path.join(jars_dir, "hadoop-aws-3.3.4.jar"),
                 os.path.join(jars_dir, "hadoop-common-3.3.4.jar"),
@@ -83,7 +83,9 @@ class SparkPipelineManager:
             if jars_path:
                 builder = builder.config("spark.jars", jars_path)
 
-            # Iceberg configurations
+            # Iceberg configurations for AWS Glue
+            # Use spark_catalog as the session catalog (Iceberg replaces default catalog)
+            # For DataFrame writeTo API, we need type=iceberg
             builder = (
                 builder
                 .config(
@@ -91,23 +93,19 @@ class SparkPipelineManager:
                     "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
                 )
                 .config(
-                    "spark.sql.catalog.iceberg_catalog",
-                    "org.apache.iceberg.spark.SparkCatalog",
+                    "spark.sql.catalog.spark_catalog",
+                    "org.apache.iceberg.spark.SparkSessionCatalog",
                 )
                 .config(
-                    "spark.sql.catalog.iceberg_catalog.catalog-impl",
-                    "org.apache.iceberg.aws.glue.GlueCatalog",
+                    "spark.sql.catalog.spark_catalog.type",
+                    "glue",
                 )
                 .config(
-                    "spark.sql.catalog.iceberg_catalog.io-impl",
-                    "org.apache.iceberg.aws.s3.S3FileIO",
-                )
-                .config(
-                    "spark.sql.catalog.iceberg_catalog.warehouse",
+                    "spark.sql.catalog.spark_catalog.warehouse",
                     self.settings.iceberg_warehouse_path,
                 )
                 .config(
-                    "spark.sql.catalog.iceberg_catalog.glue.region",
+                    "spark.sql.catalog.spark_catalog.glue.region",
                     self.settings.aws_region,
                 )
             )
@@ -115,7 +113,7 @@ class SparkPipelineManager:
             # Add Glue catalog ID if specified
             if self.settings.glue_catalog_id:
                 builder = builder.config(
-                    "spark.sql.catalog.iceberg_catalog.glue.id",
+                    "spark.sql.catalog.spark_catalog.glue.id",
                     self.settings.glue_catalog_id,
                 )
 
@@ -159,11 +157,11 @@ class SparkPipelineManager:
             )
 
             # VERIFY catalog configuration
-            catalog_impl = self._spark.conf.get("spark.sql.catalog.iceberg_catalog.catalog-impl", "NOT SET")
-            catalog_type = self._spark.conf.get("spark.sql.catalog.iceberg_catalog", "NOT SET")
-            warehouse = self._spark.conf.get("spark.sql.catalog.iceberg_catalog.warehouse", "NOT SET")
+            catalog_impl = self._spark.conf.get("spark.sql.catalog.spark_catalog.catalog-impl", "NOT SET")
+            catalog_type = self._spark.conf.get("spark.sql.catalog.spark_catalog", "NOT SET")
+            warehouse = self._spark.conf.get("spark.sql.catalog.spark_catalog.warehouse", "NOT SET")
             logger.info(
-                f"VERIFY Iceberg Catalog Config:"
+                f"VERIFY Iceberg Session Catalog Config:"
                 f"\n  Catalog type: {catalog_type}"
                 f"\n  Catalog impl: {catalog_impl}"
                 f"\n  Warehouse: {warehouse}"
@@ -207,9 +205,9 @@ class SparkPipelineManager:
         # AWS Glue requires lowercase database names
         glue_namespace = namespace.lower()
         try:
-            # Directly create namespace - IF NOT EXISTS handles duplicates
+            # With session catalog, create namespace without catalog prefix
             logger.info(f"Ensuring Iceberg namespace exists: {glue_namespace} (original: {namespace})")
-            spark.sql(f"CREATE NAMESPACE IF NOT EXISTS iceberg_catalog.`{glue_namespace}`")
+            spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {glue_namespace}")
             logger.info(f"Successfully ensured namespace: {glue_namespace}")
         except Exception as e:
             # Log the error but continue - table creation will fail if namespace truly doesn't exist
@@ -269,9 +267,12 @@ class SparkPipelineManager:
             )
 
             # Build JDBC read options
+            # Quote table name with backticks for MySQL (handles spaces, dots, special chars)
+            quoted_table = f"`{table_name}`"
+
             jdbc_options = {
                 "url": jdbc_url,
-                "dbtable": table_name,
+                "dbtable": quoted_table,
                 "user": self.settings.mysql_user,
                 "password": self.settings.mysql_password,
                 "driver": "com.mysql.cj.jdbc.Driver",
@@ -287,7 +288,8 @@ class SparkPipelineManager:
                 # For datetime columns, use a subquery with UNIX_TIMESTAMP conversion
                 if is_datetime:
                     # Use a subquery that adds UNIX_TIMESTAMP column for partitioning
-                    subquery = f"(SELECT *, UNIX_TIMESTAMP({partition_col}) as _partition_col FROM {table_name}) as t"
+                    # Use backticks for table name and column name
+                    subquery = f"(SELECT *, UNIX_TIMESTAMP(`{partition_col}`) as _partition_col FROM `{table_name}`) as t"
                     jdbc_options["dbtable"] = subquery
                     jdbc_options.update(
                         {
@@ -338,40 +340,89 @@ class SparkPipelineManager:
             row_count = df.count()
             logger.info(f"Read {row_count} rows from {schema_name}.{table_name}")
 
+            # CRITICAL FIX: Convert MySQL YEAR columns to integers
+            # Spark JDBC reads MySQL YEAR as DATE (e.g., 2025 → 2025-01-01)
+            # We need to extract just the year part as integer
+            from app.services.schema_mapper import SchemaMapper
+            from pyspark.sql.functions import col, year, when
+
+            schema_mapper_temp = SchemaMapper()
+            try:
+                mysql_columns = schema_mapper_temp.get_mysql_table_schema(schema_name, table_name)
+                year_columns = [c['COLUMN_NAME'] for c in mysql_columns if c['DATA_TYPE'].upper() == 'YEAR']
+
+                if year_columns:
+                    logger.info(f"Converting {len(year_columns)} YEAR columns to integers: {year_columns}")
+                    for year_col in year_columns:
+                        if year_col in df.columns:
+                            # Extract year from date and cast to smallint (NULL stays NULL)
+                            df = df.withColumn(
+                                year_col,
+                                when(col(f"`{year_col}`").isNotNull(),
+                                     year(col(f"`{year_col}`")).cast("smallint"))
+                                .otherwise(None)
+                            )
+                            logger.debug(f"Converted YEAR column: {year_col}")
+            except Exception as e:
+                logger.warning(f"Could not convert YEAR columns: {e}")
+
+            # CRITICAL FIX: Convert invalid dates (0000-00-00) to NULL
+            # StarRocks doesn't accept invalid MySQL dates
+            try:
+                date_columns = [c['COLUMN_NAME'] for c in mysql_columns
+                               if c['DATA_TYPE'].upper() in ('DATE', 'DATETIME')]
+
+                if date_columns:
+                    logger.info(f"Checking {len(date_columns)} date columns for invalid values")
+                    for date_col in date_columns:
+                        if date_col in df.columns:
+                            # Convert '0000-00-00' and '0000-00-00 00:00:00' to NULL
+                            df = df.withColumn(
+                                date_col,
+                                when(
+                                    (col(f"`{date_col}`").isNull()) |
+                                    (col(f"`{date_col}`").cast("string").startswith("0000-00-00")),
+                                    None
+                                ).otherwise(col(f"`{date_col}`"))
+                            )
+            except Exception as e:
+                logger.warning(f"Could not clean invalid date values: {e}")
+
             # Write to Iceberg (use target schema name - lowercase for Glue)
             glue_schema_name = iceberg_schema_name.lower()
+            # AWS Glue requires lowercase table names
+            table_name_lower = table_name.lower()
 
-            # Create temp view
-            temp_view_name = f"temp_{table_name}_{int(time.time())}"
-            df.createOrReplaceTempView(temp_view_name)
+            # AWS Glue also requires lowercase column names
+            # Convert all column names to lowercase
+            # Use backticks to escape special characters (dots, spaces, etc.)
+            from pyspark.sql.functions import col
+            df = df.select([col(f"`{c}`").alias(c.lower()) for c in df.columns])
 
-            # Use NO backticks - let Spark handle the identifiers naturally
-            full_table_name = f"iceberg_catalog.{glue_schema_name}.{table_name}"
+            # Use fully qualified name (database.table)
+            # Quote table name with backticks to handle spaces and special characters
+            full_table_name = f"{glue_schema_name}.`{table_name_lower}`"
 
             logger.info(
-                f"Writing to Iceberg via CREATE TABLE:"
+                f"Writing to Iceberg via DataFrame API:"
                 f"\n  Glue schema: {glue_schema_name}"
-                f"\n  Table: {table_name}"
+                f"\n  Table: {table_name_lower} (original: {table_name})"
                 f"\n  Full identifier: {full_table_name}"
             )
 
             try:
-                # Create table using SQL - no backticks
-                create_sql = f"CREATE TABLE IF NOT EXISTS {full_table_name} USING iceberg AS SELECT * FROM {temp_view_name}"
+                # Use DataFrame writeTo API instead of SQL CREATE TABLE
+                # This works properly with SparkSessionCatalog + GlueCatalog
+                logger.info(f"Using writeTo API for: {full_table_name}")
 
-                logger.info(f"SQL: {create_sql}")
-                spark.sql(create_sql)
+                df.writeTo(full_table_name).using("iceberg").createOrReplace()
+                
                 logger.info(f"✓ Successfully created: {full_table_name}")
 
-                spark.catalog.dropTempView(temp_view_name)
             except Exception as write_error:
                 logger.error(f"✗ Table creation failed: {write_error}")
                 import traceback
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
-                try:
-                    spark.catalog.dropTempView(temp_view_name)
-                except:
-                    pass
                 raise
 
             # Unpersist to free memory
@@ -651,12 +702,38 @@ class SparkPipelineManager:
             schema_mapper.create_starrocks_table(source_schema_name, target_schema_name, table_name)
 
             # Read from Iceberg (using TARGET schema - lowercase for Glue)
-            # spark.table() DOES accept catalog.database.table format
+            # Use fully qualified name to avoid USE DATABASE issues
             glue_schema_name = target_schema_name.lower()
-            iceberg_table_name = f"iceberg_catalog.{glue_schema_name}.{table_name}"
+            # AWS Glue requires lowercase table names
+            table_name_lower = table_name.lower()
+            # Quote table name with backticks to handle spaces and special characters
+            iceberg_table_name = f"{glue_schema_name}.`{table_name_lower}`"
 
-            logger.info(f"Reading from Iceberg table: {iceberg_table_name}")
+            logger.info(f"Reading from Iceberg table: {iceberg_table_name} (original: {table_name})")
             df = spark.table(iceberg_table_name)
+
+            # CRITICAL: Map Iceberg lowercase column names back to original MySQL case
+            # Iceberg has lowercase columns (e.g., "cityid", "cityname")
+            # StarRocks expects original MySQL case (e.g., "CityID", "CityName")
+            # Get original column names from MySQL schema
+            from app.services.schema_mapper import SchemaMapper
+            schema_mapper_temp = SchemaMapper()
+
+            try:
+                mysql_columns = schema_mapper_temp.get_mysql_table_schema(source_schema_name, table_name)
+                # Create mapping: lowercase -> original case
+                column_mapping = {col['COLUMN_NAME'].lower(): col['COLUMN_NAME']
+                                  for col in mysql_columns}
+
+                # Rename columns back to original case
+                for lower_name, original_name in column_mapping.items():
+                    if lower_name in df.columns:
+                        df = df.withColumnRenamed(lower_name, original_name)
+                        logger.debug(f"Renamed column: {lower_name} -> {original_name}")
+
+                logger.info(f"Mapped {len(column_mapping)} columns from lowercase to original case")
+            except Exception as e:
+                logger.warning(f"Could not map column names to original case: {e}. Using lowercase columns.")
 
             # Cache for count and write
             df = df.cache()
